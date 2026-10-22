@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: radon-discord-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    healthCheckPath: /health
+    autoDeploy: false

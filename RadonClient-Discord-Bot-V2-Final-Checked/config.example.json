@@ -1,0 +1,42 @@
+{
+  "prefix": "!",
+  "guildId": "YOUR_GUILD_ID",
+  "roles": {
+    "owner": "YOUR_OWNER_ROLE_ID",
+    "coOwner": "YOUR_COOWNER_ROLE_ID",
+    "dev": "YOUR_DEV_ROLE_ID",
+    "team": "YOUR_TEAM_ROLE_ID",
+    "autoRole": "YOUR_AUTO_ROLE_ID",
+    "support": [
+      "YOUR_SUPPORT_ROLE_ID"
+    ]
+  },
+  "channels": {
+    "moderationLogs": "YOUR_MODERATION_LOGS_CHANNEL_ID",
+    "ticketLogs": "YOUR_TICKET_LOGS_CHANNEL_ID",
+    "announcements": "YOUR_ANNOUNCEMENTS_CHANNEL_ID",
+    "boostNotifications": "YOUR_BOOST_CHANNEL_ID",
+    "botStatus": "YOUR_STATUS_CHANNEL_ID",
+    "salesLicenseLogs": "YOUR_SALES_CHANNEL_ID"
+  },
+  "tickets": {
+    "categoryId": "YOUR_TICKET_CATEGORY_ID",
+    "types": []
+  },
+  "branding": {
+    "product": "Radon Client",
+    "premium": "Radon+",
+    "color": "#20D5DD"
+  },
+  "botStatus": {
+    "type": "watching",
+    "text": "Radon Client"
+  },
+  "monitor": {
+    "heartbeatSeconds": 600
+  },
+  "giveaways": {
+    "maxWinners": 10
+  },
+  "commandAccess": {}
+}
