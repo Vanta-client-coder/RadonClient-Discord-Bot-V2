@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 import discord
+from core.embeds import radon_embed, add_safe_field
 
 
 STATUS_COLORS = {
@@ -46,10 +47,7 @@ class SalesChannelService:
 
     def _embed(self, data: dict[str, Any]) -> discord.Embed:
         status = str(data.get("status", "UNKNOWN")).upper()
-        embed = discord.Embed(
-            title="Radon+ License",
-            color=STATUS_COLORS.get(status, 0x20D5DD),
-        )
+        embed = radon_embed(self.bot.config, title="Radon+ License", color=STATUS_COLORS.get(status, 0x20D5DD))
         fields = [
             ("License Key", data.get("licenseKey"), False),
             ("Purchase ID", data.get("purchaseId"), True),
@@ -65,8 +63,7 @@ class SalesChannelService:
             ("Current Status", status, False),
         ]
         for name, value, inline in fields:
-            embed.add_field(name=name, value=self._display(value), inline=inline)
-        embed.set_footer(text="Radon")
+            add_safe_field(embed, name, self._display(value), inline=inline)
         return embed
 
     async def upsert(self, data: dict[str, Any]) -> dict[str, Any]:

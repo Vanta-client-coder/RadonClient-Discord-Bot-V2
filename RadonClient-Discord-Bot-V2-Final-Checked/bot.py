@@ -32,6 +32,8 @@ def load_env_file(path: Path) -> None:
 
 
 def database_path() -> Path:
+    if os.getenv("DATABASE_URL", "").strip():
+        return ROOT / "data" / "radon.db"  # Unused when PostgreSQL is configured.
     data_dir = Path(os.getenv("RADON_DATA_DIR", str(ROOT / "data"))).expanduser()
     if not data_dir.is_absolute():
         data_dir = ROOT / data_dir
@@ -58,6 +60,7 @@ class RadonBot(commands.Bot):
         intents.guilds = True
         intents.members = True
         intents.messages = True
+        intents.reactions = True
         intents.message_content = True
 
         super().__init__(
@@ -85,18 +88,24 @@ class RadonBot(commands.Bot):
             "cogs.tickets",
             "cogs.admin",
             "cogs.giveaways",
+            "cogs.weekly_activity",
         )
         for extension in extensions:
             await self.load_extension(extension)
             print(f"[Radon] Loaded extension: {extension}")
 
-        from cogs.tickets import TicketActionView, TicketPanelView
+        from cogs.tickets import TicketActionView, TicketPanelView, AutoSupportFeedbackView
         from cogs.giveaways import GiveawayView
 
         # Existing component IDs intentionally remain compatible with older
         # ticket panels and giveaway messages.
         self.add_view(TicketActionView(self))
-        self.add_view(TicketPanelView(self))
+        self.add_view(AutoSupportFeedbackView(self))
+        from core.ticket_categories import effective_ticket_types
+        if effective_ticket_types(self.config):
+            self.add_view(TicketPanelView(self))
+        else:
+            print("[Radon Tickets] No ticket types configured; ticket panel disabled until configured.")
         self.add_view(GiveawayView(self))
         print("[Radon] Persistent Discord views registered.")
 
@@ -118,6 +127,8 @@ class RadonBot(commands.Bot):
         await super().close()
 
     async def on_ready(self):
+        import time
+        self._radon_ready_monotonic = time.monotonic()
         self.connection_state = "online"
         self.last_connection_error = None
         status = self.config.get("botStatus", {})

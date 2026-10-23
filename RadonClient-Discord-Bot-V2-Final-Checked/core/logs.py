@@ -1,4 +1,4 @@
-from .embeds import radon_embed
+from .embeds import radon_embed, add_safe_field
 
 
 async def send_log(bot, channel_key, title, fields):
@@ -16,7 +16,7 @@ async def send_log(bot, channel_key, title, fields):
 
     embed = radon_embed(bot.config, title=title)
     for name, value, inline in fields:
-        embed.add_field(name=name, value=str(value)[:1024], inline=inline)
+        add_safe_field(embed, name, value, inline=inline)
 
     try:
         await channel.send(embed=embed)

@@ -1,14 +1,17 @@
 import re
+import asyncio
 from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
 
 from core.config import is_placeholder
-from core.embeds import radon_embed
+from core.embeds import radon_embed, add_safe_field
 from core.logs import send_log
 from core.permissions import is_owner_or_coowner, is_ticket_staff
 from core.transcript import create_html_transcript
+from core.ticket_auto_reply import match_ticket_issue
+from core.ticket_categories import effective_ticket_types
 
 
 def safe_channel_name(text):
@@ -18,8 +21,10 @@ def safe_channel_name(text):
 
 
 def ticket_type_from_config(bot, type_id):
+    if type_id == "support" and not bot.config.get("tickets", {}).get("types"):
+        return {"id": "support", "label": "Support", "openingPrompt": "Describe how our team can help you."}
     return next(
-        (item for item in bot.config.get("tickets", {}).get("types", []) if item.get("id") == type_id),
+        (item for item in effective_ticket_types(bot.config) if item.get("id") == type_id),
         None,
     )
 
@@ -54,7 +59,7 @@ class TicketSelect(discord.ui.Select):
                 value=item["id"][:100],
                 description=item.get("description", "")[:100],
             )
-            for item in bot.config.get("tickets", {}).get("types", [])
+            for item in effective_ticket_types(bot.config)
         ]
         super().__init__(
             placeholder="Select a support category...",
@@ -285,9 +290,9 @@ async def create_ticket(bot, interaction, type_id):
         f"Radon • {ticket_type['label']}",
         f"Welcome {interaction.user.mention}.\n\n{welcome}",
     )
-    embed.add_field(name="Ticket Type", value=ticket_type["label"], inline=True)
-    embed.add_field(name="Opened By", value=interaction.user.mention, inline=True)
-    embed.add_field(name="What to Include", value=prompt, inline=False)
+    add_safe_field(embed, name="Ticket Type", value=ticket_type["label"], inline=True)
+    add_safe_field(embed, name="Opened By", value=interaction.user.mention, inline=True)
+    add_safe_field(embed, name="What to Include", value=prompt, inline=False)
     ticket_rule_text = (
         "No prank/test tickets, no spam, no duplicate tickets and no unnecessary staff pings. "
         "Please remain respectful."
@@ -296,7 +301,8 @@ async def create_ticket(bot, interaction, type_id):
         ticket_rule_text += (
             " Giveaway claims are verified against the giveaway record. Fake claims or edited proof are not allowed."
         )
-    embed.add_field(name="Ticket Rules", value=ticket_rule_text, inline=False)
+    add_safe_field(embed, name="Ticket Rules", value=ticket_rule_text, inline=False)
+    add_safe_field(embed, name="Next Step", value="Describe your issue in your first message. Radon Auto Support can suggest a solution, and you can request staff help if needed.", inline=False)
 
     await channel.send(content=interaction.user.mention, embed=embed, view=TicketActionView(bot))
     await interaction.followup.send(
@@ -341,16 +347,16 @@ async def close_ticket(bot, channel, closed_by):
 
     if log_channel:
         embed = radon_embed(bot.config, "Ticket Closed")
-        embed.add_field(name="Ticket Owner", value=f"<@{ticket['owner_id']}>", inline=True)
-        embed.add_field(name="Ticket Type", value=type_label, inline=True)
-        embed.add_field(name="Closed By", value=closed_by.mention, inline=True)
-        embed.add_field(
+        add_safe_field(embed, name="Ticket Owner", value=f"<@{ticket['owner_id']}>", inline=True)
+        add_safe_field(embed, name="Ticket Type", value=type_label, inline=True)
+        add_safe_field(embed, name="Closed By", value=closed_by.mention, inline=True)
+        add_safe_field(embed, 
             name="Claimed By",
             value=f"<@{ticket['claimed_by']}>" if ticket["claimed_by"] else "Not claimed",
             inline=True,
         )
-        embed.add_field(name="Opened At", value=ticket["opened_at"], inline=False)
-        embed.add_field(name="Closed At", value=closed_at, inline=False)
+        add_safe_field(embed, name="Opened At", value=ticket["opened_at"], inline=False)
+        add_safe_field(embed, name="Closed At", value=closed_at, inline=False)
 
         kwargs = {"embed": embed}
         if transcript and transcript.exists():
@@ -367,9 +373,196 @@ async def close_ticket(bot, channel, closed_by):
         print(f"[TICKET DELETE ERROR] {exc}")
 
 
+REACTION_EMOJI = "🎫"
+REACTION_PANEL_MARKER = "Radon Ticket Reaction Panel"
+
+
+class ReactionResponse:
+    async def defer(self, **kwargs):
+        return None
+
+    def __init__(self, user):
+        self.user = user
+
+    async def send_message(self, message, **kwargs):
+        await ReactionFollowup(self.user).send(message, **kwargs)
+
+
+class ReactionFollowup:
+    def __init__(self, user):
+        self.user = user
+
+    async def send(self, message, **kwargs):
+        try:
+            await self.user.send(message)
+        except (discord.Forbidden, discord.HTTPException):
+            print("[Radon Tickets] Ticket feedback could not be delivered via DM.")
+
+
+class ReactionTicketContext:
+    def __init__(self, guild, member):
+        self.guild = guild
+        self.user = member
+        self.response = ReactionResponse(member)
+        self.followup = ReactionFollowup(member)
+
+
+class AutoSupportFeedbackView(discord.ui.View):
+    """Persistent, single-use feedback controls on automatic ticket answers."""
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def _handle(self, interaction, choice):
+        ticket = self.bot.db.get_ticket(interaction.channel_id)
+        if not ticket or str(ticket["owner_id"]) != str(interaction.user.id):
+            return await interaction.response.send_message(
+                "Only the person who opened this ticket can answer this question while the ticket is open.", ephemeral=True)
+        if not self.bot.db.set_auto_support_feedback(interaction.channel_id, interaction.user.id, choice):
+            return await interaction.response.send_message(
+                "You have already responded, or the automatic support response is no longer active.", ephemeral=True)
+        if choice == "helped":
+            return await interaction.response.send_message(
+                "Glad the suggestions helped! You can close your ticket when you're ready."
+            )
+        await interaction.response.send_message("A staff member has been requested. Please describe any extra details here.")
+        cfg = self.bot.config.get("roles", {})
+        role_values = cfg.get("support") or []
+        if not isinstance(role_values, (list, tuple)):
+            role_values = [role_values]
+        # Ping Support only after an explicit user click; never @everyone.
+        roles = [interaction.guild.get_role(int(x)) for x in role_values if str(x).isdigit()]
+        roles = [r for r in roles if r is not None and r.mentionable]
+        try:
+            if roles:
+                await interaction.channel.send(
+                    " ".join(role.mention for role in roles) + " • Support requested by " + interaction.user.display_name,
+                    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=roles),
+                )
+            else:
+                await interaction.channel.send(
+                    "**Staff assistance requested.** A support team member can review this ticket. "
+                    "(No mentionable Support role was configured.)",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            print("[Radon Tickets] Could not post the staff escalation message.")
+
+    @discord.ui.button(label="That helped", style=discord.ButtonStyle.success,
+                       custom_id="radon:auto_support:helped")
+    async def helped(self, interaction, button):
+        await self._handle(interaction, "helped")
+
+    @discord.ui.button(label="Didn't help — Contact Staff", style=discord.ButtonStyle.primary,
+                       custom_id="radon:auto_support:staff")
+    async def staff(self, interaction, button):
+        await self._handle(interaction, "staff")
+
+
 class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._reaction_locks = {}
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Reply once to the first text message written by the ticket creator."""
+        if not message.guild or message.author.bot or not isinstance(message.channel, discord.TextChannel):
+            return
+        content = (message.content or "").strip()
+        if not content or content.startswith(self.bot.config.get("prefix", "!")):
+            return
+        # Avoid API lookups on messages in ordinary channels.
+        ticket = self.bot.db.get_ticket(message.channel.id)
+        if not ticket or str(message.author.id) != str(ticket["owner_id"]):
+            return
+        if not self.bot.db.claim_first_ticket_auto_reply(message.channel.id, message.author.id):
+            return
+        topic, reply = match_ticket_issue(content)
+        try:
+            await message.reply(
+                embed=radon_embed(
+                    self.bot.config,
+                    f"Radon Auto Support • {topic}",
+                    reply + "\n\n*This is an automatic suggestion based on your first message. "
+                    "It may not match your issue exactly. If the steps helped, choose **That helped**. "
+                    "Otherwise select **Didn't help — Contact Staff** and we will ask staff to assist.*",
+                ),
+                view=AutoSupportFeedbackView(self.bot),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[Radon Tickets] Auto reply could not be delivered ({type(exc).__name__}).")
+
+    @commands.command(name="ticketreaction")
+    async def ticketreaction(self, ctx):
+        """Post a ticket panel where members react with 🎫 to create a support ticket."""
+        if not ctx.guild or not is_owner_or_coowner(ctx.author, self.bot.config):
+            return await ctx.send("Only a Radon Owner or Co-Owner can create a reaction ticket panel.")
+        embed = radon_embed(
+            self.bot.config, "Radon Support Tickets",
+            "React with 🎫 below to open a private support ticket. "
+            "You can only have the configured number of open tickets at once."
+        )
+        embed.set_footer(text=REACTION_PANEL_MARKER)
+        try:
+            message = await ctx.send(embed=embed)
+            await message.add_reaction(REACTION_EMOJI)
+        except discord.Forbidden:
+            return await ctx.send("I need Send Messages, Embed Links and Add Reactions permissions.")
+        except discord.HTTPException:
+            return await ctx.send("Discord could not create the reaction ticket panel. Please retry later.")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        if payload.guild_id is None or str(payload.emoji) != REACTION_EMOJI:
+            return
+        if self.bot.user and payload.user_id == self.bot.user.id:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        channel = guild.get_channel(payload.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            return
+        if not self.bot.user or message.author.id != self.bot.user.id:
+            return
+        if not message.embeds or not message.embeds[0].footer or message.embeds[0].footer.text != REACTION_PANEL_MARKER:
+            return
+        member = payload.member or guild.get_member(payload.user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                return
+        if member.bot:
+            return
+        # Avoid duplicate channels from repeated reactions by the same user.
+        key = (guild.id, member.id)
+        lock = self._reaction_locks.setdefault(key, asyncio.Lock())
+        try:
+            async with lock:
+                types = effective_ticket_types(self.bot.config)
+                default_type = (types[0].get("id") if self.bot.config.get("tickets", {}).get("types") else "support")
+                if default_type:
+                    try:
+                        await create_ticket(self.bot, ReactionTicketContext(guild, member), default_type)
+                    except Exception as exc:
+                        print(f"[Radon Tickets] Reaction ticket failed ({type(exc).__name__}).")
+        finally:
+            # Keep the lock registered: removing it while another event waits
+            # could let a third event bypass the per-member queue.
+            pass
+        # Clearing the user's reaction lets them use the panel again later.
+        try:
+            await message.remove_reaction(payload.emoji, member)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     @commands.command()
     async def ticketpanel(self, ctx):
@@ -385,19 +578,21 @@ class Tickets(commands.Cog):
         )
 
         category_lines = []
-        for item in tickets_cfg.get("types", []):
+        for item in effective_ticket_types(self.bot.config):
             category_lines.append(f"**{item.get('label', item.get('id', 'Ticket'))}** — {item.get('details', item.get('description', 'Support request'))}")
         if category_lines:
-            embed.add_field(
+            # Discord embed fields cap at 1024 characters. Avoid listing only some choices.
+            preview = "\n".join(category_lines[:7])
+            add_safe_field(embed, 
                 name=panel.get("categoryTitle", "Choose the Right Category"),
-                value="\n\n".join(category_lines)[:1024],
+                value=(preview[:900] + "\n**And more categories in the menu below.**")[:1024],
                 inline=False,
             )
 
         rules = panel.get("rules", [])
         if rules:
             rules_text = "\n".join(f"• {rule}" for rule in rules)
-            embed.add_field(
+            add_safe_field(embed, 
                 name=panel.get("rulesTitle", "Ticket Rules"),
                 value=rules_text[:1024],
                 inline=False,
@@ -405,7 +600,7 @@ class Tickets(commands.Cog):
 
         footer_note = panel.get("footerNote")
         if footer_note:
-            embed.add_field(name="Important", value=footer_note[:1024], inline=False)
+            add_safe_field(embed, name="Important", value=footer_note[:1024], inline=False)
 
         await ctx.send(embed=embed, view=TicketPanelView(self.bot))
 

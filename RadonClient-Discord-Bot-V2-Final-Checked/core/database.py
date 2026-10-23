@@ -1,15 +1,35 @@
 import sqlite3
+import os
 from pathlib import Path
 from threading import Lock
 
 
 class Database:
     def __init__(self, path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
         self.lock = Lock()
-        self._setup()
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if database_url:
+            from core.postgres_backend import PostgresConnection
+            self.conn = PostgresConnection(database_url)
+            self.backend = "postgresql"
+            self._setup_postgres()
+            print("[DATABASE] PostgreSQL connected; persistent storage enabled.")
+        else:
+            if os.getenv("RADON_REQUIRE_PERSISTENT_DB", "").lower() in ("1", "true", "yes"):
+                raise RuntimeError("Persistent database required: configure DATABASE_URL before deploying.")
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+            self.conn.row_factory = sqlite3.Row
+            self.backend = "sqlite"
+            self._setup()
+            if os.getenv("RENDER", "").lower() in ("true", "1"):
+                print("[DATABASE WARNING] SQLite on Render's ephemeral filesystem can lose records on deploy. Configure DATABASE_URL.")
+
+    def _setup_postgres(self):
+        from core.postgres_backend import POSTGRES_SCHEMA
+        with self.lock, self.conn:
+            for statement in POSTGRES_SCHEMA:
+                self.conn.execute(statement)
 
     def _setup(self):
         with self.lock, self.conn:
@@ -62,6 +82,21 @@ class Database:
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 )
             """)
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS weekly_activity (
+                guild_id TEXT NOT NULL, week TEXT NOT NULL, user_id TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0, last_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(guild_id, week, user_id))""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS weekly_reports (
+                guild_id TEXT NOT NULL, week TEXT NOT NULL, channel_id TEXT NOT NULL,
+                message_id TEXT NOT NULL, PRIMARY KEY(guild_id, week))""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS weekly_invites (
+                guild_id TEXT NOT NULL, week TEXT NOT NULL, user_id TEXT NOT NULL,
+                inviter_id TEXT NOT NULL, PRIMARY KEY(guild_id, week, user_id))""")
+            ticket_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(tickets)").fetchall()}
+            if "first_auto_reply_done" not in ticket_columns:
+                self.conn.execute("ALTER TABLE tickets ADD COLUMN first_auto_reply_done INTEGER NOT NULL DEFAULT 0")
+            if "auto_support_feedback" not in ticket_columns:
+                self.conn.execute("ALTER TABLE tickets ADD COLUMN auto_support_feedback TEXT")
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(license_sales_messages)").fetchall()}
             if "metadata_json" not in columns:
                 self.conn.execute("ALTER TABLE license_sales_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}' ")
@@ -100,6 +135,29 @@ class Database:
             return self.conn.execute(
                 "SELECT * FROM tickets WHERE channel_id=? AND status='open'", (str(channel_id),)
             ).fetchone()
+
+    def claim_first_ticket_auto_reply(self, channel_id, owner_id):
+        """Atomically mark the first eligible ticket reply, even with concurrent messages."""
+        with self.lock, self.conn:
+            cursor = self.conn.execute(
+                "UPDATE tickets SET first_auto_reply_done=1 "
+                "WHERE channel_id=? AND owner_id=? AND status='open' AND first_auto_reply_done=0",
+                (str(channel_id), str(owner_id)),
+            )
+            return cursor.rowcount == 1
+
+    def set_auto_support_feedback(self, channel_id, owner_id, feedback):
+        """Allow one feedback choice, only on an open ticket already auto-answered."""
+        if feedback not in ("helped", "staff"):
+            return False
+        with self.lock, self.conn:
+            result = self.conn.execute(
+                "UPDATE tickets SET auto_support_feedback=? "
+                "WHERE channel_id=? AND owner_id=? AND status='open' "
+                "AND first_auto_reply_done=1 AND auto_support_feedback IS NULL",
+                (feedback, str(channel_id), str(owner_id)),
+            )
+            return result.rowcount == 1
 
     def get_open_tickets_for_user(self, guild_id, owner_id):
         with self.lock:
@@ -160,11 +218,11 @@ class Database:
     def add_giveaway_entry(self, message_id, user_id):
         try:
             with self.lock, self.conn:
-                self.conn.execute(
-                    "INSERT INTO giveaway_entries(message_id,user_id) VALUES(?,?)",
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO giveaway_entries(message_id,user_id) VALUES(?,?)",
                     (str(message_id), str(user_id)),
                 )
-            return True
+                return cur.rowcount > 0
         except sqlite3.IntegrityError:
             return False
 
@@ -213,3 +271,38 @@ class Database:
     def set_sales_message_id(self, license_key, message_id):
         metadata_json = self.get_sales_metadata_json(license_key)
         self.set_sales_state(license_key, message_id, metadata_json)
+
+    def record_weekly_message(self, guild_id, week, user_id, timestamp):
+        # Enforce a 15 second cooldown to discourage flooding.
+        with self.lock, self.conn:
+            existing = self.conn.execute("SELECT last_at FROM weekly_activity WHERE guild_id=? AND week=? AND user_id=?", (str(guild_id), week, str(user_id))).fetchone()
+            if existing and timestamp - existing[0] < 15:
+                return False
+            self.conn.execute("""INSERT INTO weekly_activity (guild_id, week, user_id, count, last_at) VALUES (?,?,?,?,?)
+                ON CONFLICT(guild_id,week,user_id) DO UPDATE SET count=count+1,last_at=excluded.last_at""", (str(guild_id), week, str(user_id), 1, timestamp))
+            return True
+
+    def weekly_top(self, guild_id, week, limit=10):
+        with self.lock:
+            return [(row[0], row[1]) for row in self.conn.execute("SELECT user_id,count FROM weekly_activity WHERE guild_id=? AND week=? ORDER BY count DESC,user_id ASC LIMIT ?", (str(guild_id), week, limit)).fetchall()]
+
+    def get_weekly_report(self, guild_id, week):
+        with self.lock:
+            return self.conn.execute("SELECT message_id FROM weekly_reports WHERE guild_id=? AND week=?", (str(guild_id),week)).fetchone()
+
+    def set_weekly_report(self, guild_id, week, channel_id, message_id):
+        with self.lock, self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO weekly_reports VALUES (?,?,?,?)", (str(guild_id),week,str(channel_id),str(message_id)))
+
+    def recent_weekly_reports(self, guild_id, limit=8):
+        with self.lock:
+            return [tuple(x) for x in self.conn.execute("SELECT week,channel_id,message_id FROM weekly_reports WHERE guild_id=? ORDER BY week DESC LIMIT ?", (str(guild_id), limit))]
+
+    def mark_weekly_invitation(self, guild_id, week, user_id, inviter_id):
+        with self.lock, self.conn:
+            cur = self.conn.execute("INSERT OR IGNORE INTO weekly_invites VALUES (?,?,?,?)", (str(guild_id),week,str(user_id),str(inviter_id)))
+            return cur.rowcount > 0
+
+    def clear_weekly_invitation(self, guild_id, week, user_id):
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM weekly_invites WHERE guild_id=? AND week=? AND user_id=?", (str(guild_id),week,str(user_id)))

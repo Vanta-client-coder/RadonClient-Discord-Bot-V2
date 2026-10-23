@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 
-from core.embeds import radon_embed
+from core.embeds import radon_embed, add_safe_field
 
 
 class Utility(commands.Cog):
@@ -9,43 +9,62 @@ class Utility(commands.Cog):
         self.bot = bot
 
     @commands.command(name="help")
-    async def help_command(self, ctx):
-        embed = radon_embed(
-            self.bot.config,
-            "Radon Commands",
-            "Command access is controlled by your configured Radon role. Commands not listed for a role are blocked.",
-        )
-        embed.add_field(
-            name="Radon Owner / Radon Co-Owner",
-            value=(
-                "Full access: moderation, tickets, utility and management commands.\n"
-                "`!lock` `!unlock` `!announce <text>` `!dm @member <text>` `!membercount`\n"
-                "`!giveaway <duration> <winners> <prize>` `!giveawayend <message-id>`\n"
-                "`!giveawayreroll <message-id>` `!giveawaycancel <message-id>`"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="Radon Dev",
-            value="`!ban @member [reason]`\n`!kick @member [reason]`\n`!timeout @member <duration> [reason]`",
-            inline=False,
-        )
-        embed.add_field(
-            name="Radon Team",
-            value="`!timeout @member <duration> [reason]`",
-            inline=False,
-        )
-        embed.add_field(
-            name="Radon Support",
-            value="`!claim` `!close` `!add @member` `!remove @member` `!rename <name>`",
-            inline=False,
-        )
-        embed.add_field(
-            name="Timeout Examples",
-            value="`30s` • `10m` • `2h` • `1d` • maximum `28d`",
-            inline=False,
-        )
+    async def help_command(self, ctx, *, command_name: str = None):
+        """Display only commands that the user can actually run, with usage guidance."""
+        from core.permissions import command_allowed
+        if command_name:
+            command = self.bot.get_command(command_name.strip().lower())
+            if command is None or command.hidden or not command_allowed(ctx.author, command.qualified_name, self.bot.config):
+                return await ctx.send(embed=radon_embed(self.bot.config, "Command not available", "This command is unavailable to your role or does not exist.", kind="warning"))
+            prefix = self.bot.config.get("prefix", "!")
+            usage = f"{prefix}{command.qualified_name} {command.signature}".strip()
+            embed = radon_embed(self.bot.config, f"Help • {command.qualified_name}", command.help or "No description is available.")
+            add_safe_field(embed, "Usage", f"`{usage}`")
+            return await ctx.send(embed=embed)
+
+        categories = {
+            "General": ["help", "ping", "userinfo", "membercount", "serverinfo", "botinfo", "uptime"],
+            "Moderation": ["ban", "kick", "timeout", "untimeout", "clear", "warn", "warnings", "delwarn"],
+            "Tickets": ["ticketpanel", "ticketreaction", "claim", "close", "add", "remove", "rename"],
+            "Weekly Community": ["weeklyactivity"],
+            "Giveaways": ["giveaway", "giveawayend", "giveawayreroll", "giveawaycancel"],
+            "Management": ["lock", "unlock", "announce", "dm", "testdm"],
+        }
+        prefix = self.bot.config.get("prefix", "!")
+        embed = radon_embed(self.bot.config, "Radon Client • Command Center", "Commands shown below are available to your configured roles. Use `" + prefix + "help <command>` for syntax and details.")
+        found = 0
+        for category, names in categories.items():
+            visible = [n for n in names if self.bot.get_command(n) and command_allowed(ctx.author, n, self.bot.config)]
+            if visible:
+                add_safe_field(embed, category, "  ".join(f"`{prefix}{n}`" for n in visible))
+                found += len(visible)
+        if not found:
+            add_safe_field(embed, "No available commands", "Contact support if you believe this is a mistake.")
+        embed.set_footer(text="Radon Client V2 • Discord permissions and role hierarchy still apply")
         await ctx.send(embed=embed)
+
+    @commands.command(name="botinfo", help="Show the client bot's connection and feature overview.")
+    async def botinfo(self, ctx):
+        embed = radon_embed(self.bot.config, "Radon Client • Bot Information", "Community management, support tickets, giveaways and scheduled activity summaries.")
+        add_safe_field(embed, "Connection", "Connected to Discord" if self.bot.is_ready() else "Connecting", inline=True)
+        add_safe_field(embed, "Servers", str(len(self.bot.guilds)), inline=True)
+        add_safe_field(embed, "Latency", f"{max(0, round(self.bot.latency * 1000))} ms", inline=True)
+        add_safe_field(embed, "Support", "Use the configured ticket panel for assistance.")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="uptime", help="Display how long the bot has been connected since its latest ready event.")
+    async def uptime(self, ctx):
+        import time
+        started = getattr(self.bot, "_radon_ready_monotonic", None)
+        if started is None:
+            message = "Startup duration is not available yet."
+        else:
+            seconds = max(0, int(time.monotonic() - started))
+            days, rem = divmod(seconds, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, secs = divmod(rem, 60)
+            message = f"**{days}d {hours}h {minutes}m {secs}s** since the latest ready event."
+        await ctx.send(embed=radon_embed(self.bot.config, "Radon Client • Uptime", message))
 
     @commands.command()
     async def ping(self, ctx):

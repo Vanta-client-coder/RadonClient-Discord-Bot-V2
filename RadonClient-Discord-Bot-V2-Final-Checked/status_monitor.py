@@ -1,3 +1,4 @@
+from core.embeds import color_from_config
 """Conservative Discord status heartbeat. Avoids excessive API traffic."""
 import asyncio
 import random
@@ -123,7 +124,7 @@ class RadonStatusMonitor:
         embed = discord.Embed(
             title=STATUS_EMBED_TITLE,
             description="🟢 **ONLINE**\n\nStatus refreshes periodically. An old heartbeat may indicate interrupted connectivity.",
-            color=0x20D5DD,
+            color=color_from_config(self.bot.config),
             timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="Online since", value=f"<t:{started}:F>\n<t:{started}:R>", inline=False)

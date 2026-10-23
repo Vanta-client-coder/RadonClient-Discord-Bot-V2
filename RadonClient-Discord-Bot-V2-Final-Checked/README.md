@@ -201,3 +201,14 @@ Python 3.12+ is recommended.
 ```
 
 For local use, copy `.env.example` to `.env` and fill in your local values. `.env` is ignored by Git.
+
+
+## Permanente database op Render
+
+**Nieuw:** zet `DATABASE_URL` en `RADON_REQUIRE_PERSISTENT_DB=1` in de Render Environment voordat je deze versie deployt.
+
+Lees `PERMANENT-DATABASE-SETUP.md` voor back-ups, migratie, prijzen/retentie en veilige tests. De oude werkende service wordt hierdoor niet automatisch gewijzigd.
+
+### Nieuwe databasecheck (vóór Render deployment)
+
+Zie `SUPABASE-RENDER-STAPPEN.md` voor de eenvoudige stappen. Met `DATABASE_URL` privé ingesteld kan `python check_database.py` een **read-only** check uitvoeren. De checker print geen wachtwoord, past geen records aan en meldt ontbrekende tabellen zonder die zelf te maken. Hiermee is nog geen werkende live-koppeling bewezen.
